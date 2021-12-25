@@ -36,6 +36,37 @@
 #endif /* BUILD_CURL_ADVANCED */
 
 namespace priv {
+struct wrapped_slist {
+  struct curl_slist *slist;
+
+  wrapped_slist() : slist(nullptr) {}
+  wrapped_slist(const wrapped_slist& other)
+  {
+    struct curl_slist *tmp = other.slist;
+    while (tmp != nullptr) {
+      slist = curl_slist_append(slist, tmp->data);
+      tmp = tmp->next;
+    }
+  }
+  ~wrapped_slist() { clear(); }
+
+  void push(const std::string& str) { slist = curl_slist_append(slist, str.c_str()); }
+  void batch_push(std::vector<std::string> strs) {
+    for (const auto& str : strs) push(str);
+  }
+  std::size_t size() {
+    std::size_t count{0};
+    struct curl_slist *tmp = slist;
+    while (tmp != nullptr) {
+      ++count;
+      tmp = tmp->next;
+    }
+    return count;
+  };
+
+  void clear() { curl_slist_free_all(slist); }
+};
+
 // factored out stuff that does not depend on the template parameters
 class curl_internal {
  public:
@@ -61,12 +92,16 @@ class curl_internal {
 
 #ifdef BUILD_CURL_ADVANCED
  protected:
-  std::vector<std::string> user_headers;
+  wrapped_slist user_headers;
+  wrapped_slist connect_to_list;
+  wrapped_slist proxyheaders;
+  std::string postfields;
   void apply_opts(CURL* curl, const Json::Value& opts);
 #endif /* BUILD_CURL_ADVANCED */
 };
 
 std::vector<std::string> vectorize(const std::string& input, const char* delim = nullptr);
+
 
 }  // namespace priv
 

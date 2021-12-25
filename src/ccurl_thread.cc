@@ -145,31 +145,22 @@ curl_internal::curl_internal(const std::string &url) : curl(curl_easy_init()) {
 /* fetch our datums */
 void curl_internal::do_work() {
   CURLcode res;
-  struct headers_ {
-    struct curl_slist *h;
-
-    headers_() : h(nullptr) {}
-    ~headers_() { curl_slist_free_all(h); }
-  } headers;
-
+  //copy construct a temporary header list, so as not to destroy the original
+  wrapped_slist headers(user_headers);
   data.clear();
 
-  for (const auto& usr_hdr : user_headers) {
-    headers.h = curl_slist_append(headers.h, usr_hdr.c_str());
-  }
-
+  //updating the headers with etag and last_modified values is clever,
+  //but it makes handling the data a little wonky....
   if (!last_modified.empty()) {
-    headers.h = curl_slist_append(
-        headers.h, ("If-Modified-Since: " + last_modified).c_str());
+    headers.push("If-Modified-Since: " + last_modified);
     last_modified.clear();
   }
   if (!etag.empty()) {
-    headers.h =
-        curl_slist_append(headers.h, ("If-None-Match: " + etag).c_str());
+    headers.push("If-None-Match: " + etag);
     etag.clear();
   }
-  if (headers.h)
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.h);
+  if (headers.slist)
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.slist);
 
   res = curl_easy_perform(curl);
   char *url = NULL;
@@ -200,29 +191,91 @@ void curl_internal::do_work() {
 }
 
 #ifdef BUILD_CURL_ADVANCED
+//simple string opt
+#define CASE_STR_OPT(name) \
+    case cexpr_hash(#name): \
+      curl_easy_setopt(curl, CURLOPT_##name, opts[opt_name].asString().c_str()); \
+      break;
 
-#define TRY_STR_OPT(name) \
-  if (opt_name == #name) { \
-    curl_easy_setopt(curl, CURLOPT_##name, opts[opt_name].asString().c_str()); \
-    continue; \
-  }
+#define CASE_STR_CACHE_OPT(name, cache_var) \
+    case cexpr_hash(#name): \
+      cache_var = opts[opt_name].asString(); \
+      curl_easy_setopt(curl, CURLOPT_##name, cache_var.c_str()); \
+      break;
 
-#define TRY_LONG_OPT(name) \
-  if (opt_name == #name) { \
-    curl_easy_setopt(curl, CURLOPT_##name, opts[opt_name].asUInt64()); \
-    continue; \
-  }
+//simple long opt
+#define CASE_LONG_OPT(name) \
+    case cexpr_hash(#name): \
+      curl_easy_setopt(curl, CURLOPT_##name, opts[opt_name].asInt64()); \
+      break;
 
-#define TRY_MASK(name, stem, in_var, mask_var) \
-  if (in_var == #name) { \
-    mask_var |= stem##name ; \
-    continue; \
-  }
+//bitmask opt defines
+#define BEGIN_CASE_MASK_OPT(name) \
+    case cexpr_hash(#name): \
+      { /* extra scoping for initialized variables */ \
+        long mask {0}; \
+        for (const auto& token : vectorize(opts[opt_name], ",")) { \
+          switch (cexpr_hash( token.c_str(), token.size() )) {
 
-#define TRY_AUTH_MASK(name) TRY_MASK(name, CURLAUTH_, token, mask)
-#define TRY_PROTO_MASK(name) TRY_MASK(name, CURLPROTO_, token, mask)
+// fully expanded mask chunk
+#define CASE_MASK(name, stem) \
+          case cexpr_hash(#name): \
+            mask |= stem##name ; \
+            break;
 
-#define TRY_PROXY_TYPE(name) if (type_str == #name) type = CURLPROXY_##name;
+// specific instantiations of CASE_MASK
+#define CASE_AUTH_MASK(name) CASE_MASK(name, CURLAUTH_)
+#define CASE_PROTO_MASK(name) CASE_MASK(name, CURLPROTO_)
+
+#define END_CASE_MASK_OPT(name) \
+          default: \
+            NORM_ERR("curl option '##name' given unknown token '%s'", token.c_str()); \
+            break; \
+          } /* end switch */ \
+        } /* end for */ \
+        curl_easy_setopt(curl, CURLOPT_##name, mask); \
+      }  /* end scope */ \
+      break;
+
+
+
+//enum opt defines
+#define BEGIN_CASE_ENUM_OPT(name) \
+    case cexpr_hash(#name): \
+      { /* extra scope for variable initialization */ \
+        auto type_str = opts[opt_name].asString(); \
+        unsigned long type{0}; \
+        switch (cexpr_hash( type_str.c_str(), type_str.size() )) {
+
+// fully expanded enum chunk
+#define CASE_ENUM(name, stem) \
+        case cexpr_hash(#name): \
+          type = stem##name; \
+          break;
+
+// specific instantiations
+#define CASE_PROXY_ENUM(name) CASE_ENUM(name, CURLPROXY_)
+
+#define END_CASE_ENUM_OPT(name) \
+        default: \
+          NORM_ERR("curl option '##name' given unknown token '%s'", type_str.c_str()); \
+          break; \
+        } \
+        curl_easy_setopt(curl, CURLOPT_##name, type); \
+      } /* end scope */ \
+      break;
+
+
+// expect cache_var to be of type wrapped_slist.
+// the cache_var must have a lifecycle preceeding assignment here
+// and extending past the call to curl_easy_perform.
+#define CASE_LIST_OPT(name, cache_var) \
+    case cexpr_hash(#name): \
+      cache_var.batch_push(vectorize(opts[opt_name], ",")); \
+      curl_easy_setopt(curl, CURLOPT_##name, cache_var.slist); \
+      break; 
+
+    
 
 std::vector<std::string> vectorize(const Json::Value& input, const char* delim)
 {
@@ -250,134 +303,208 @@ std::vector<std::string> vectorize(const Json::Value& input, const char* delim)
   return tokens;
 }
 
+//helpers to do compile-time hashing of tokens
+class conststr
+{
+    const char* p;
+    std::size_t sz;
+public:
+    template<std::size_t N>
+    constexpr conststr(const char(&a)[N]) : p(a), sz(N - 1) {}
+ 
+    constexpr char operator[](std::size_t n) const
+    {
+        return n < sz ? p[n] : throw std::out_of_range("");
+    }
+    constexpr std::size_t size() const { return sz; }
+    constexpr const char* data() const {return p; }
+};
+
+constexpr std::size_t cexpr_hash(const char* s, std::size_t n_max, std::size_t n = 0, std::size_t p_pow=1, std::size_t h = 0) {
+  //yoink constants and algorithm from https://cp-algorithms.com/string/string-hashing.html
+  const int p = 31;
+  const int m = 1e9 + 9;
+  return n == n_max ? h :
+      cexpr_hash( s, n_max, n+1, (p_pow * p) % m, (h + (s[n] - '`') * p_pow) % m );
+}
+
+constexpr std::size_t cexpr_hash(conststr s) {
+  return cexpr_hash(s.data(), s.size());
+}
+
+
 //function to apply opts to curl
 void curl_internal::apply_opts(CURL* curl, const Json::Value& opts) {
   for (const auto& opt_name : opts.getMemberNames()) {
-    TRY_LONG_OPT(VERBOSE)
-    TRY_LONG_OPT(HEADER)
-    TRY_LONG_OPT(PATH_AS_IS)
-    if (opt_name == "PROTOCOLS") {
-      auto tokens = vectorize(opts[opt_name], ",");
-      unsigned long mask{0};
-      for (const auto& token : tokens) {
-        TRY_PROTO_MASK(DICT)
-        TRY_PROTO_MASK(FILE)
-        TRY_PROTO_MASK(FTP)
-        TRY_PROTO_MASK(FTPS)
-        TRY_PROTO_MASK(GOPHER)
-        TRY_PROTO_MASK(HTTP)
-        TRY_PROTO_MASK(HTTPS)
-        TRY_PROTO_MASK(IMAP)
-        TRY_PROTO_MASK(IMAPS)
-        TRY_PROTO_MASK(LDAP)
-        TRY_PROTO_MASK(LDAPS)
-        TRY_PROTO_MASK(POP3)
-        TRY_PROTO_MASK(POP3S)
-        TRY_PROTO_MASK(RTMP)
-        TRY_PROTO_MASK(RTMPE)
-        TRY_PROTO_MASK(RTMPS)
-        TRY_PROTO_MASK(RTMPT)
-        TRY_PROTO_MASK(RTMPTE)
-        TRY_PROTO_MASK(RTMPTS)
-        TRY_PROTO_MASK(RTSP)
-        TRY_PROTO_MASK(SCP)
-        TRY_PROTO_MASK(SFTP)
-        TRY_PROTO_MASK(SMB)
-        TRY_PROTO_MASK(SMBS)
-        TRY_PROTO_MASK(SMTP)
-        TRY_PROTO_MASK(SMTPS)
-        TRY_PROTO_MASK(TELNET)
-        TRY_PROTO_MASK(TFTP)
-        NORM_ERR("curl option 'PROTOCOLS' given unknown token '%s'", token.c_str());
-      }
-      curl_easy_setopt(curl, CURLOPT_PROTOCOLS, mask);
-      continue;
-    } 
-    if (opt_name == "REDIR_PROTOCOLS") {
-      auto tokens = vectorize(opts[opt_name], ",");
-      unsigned long mask{0};
-      for (const auto& token : tokens) {
-        TRY_PROTO_MASK(DICT)
-        TRY_PROTO_MASK(FILE)
-        TRY_PROTO_MASK(FTP)
-        TRY_PROTO_MASK(FTPS)
-        TRY_PROTO_MASK(GOPHER)
-        TRY_PROTO_MASK(HTTP)
-        TRY_PROTO_MASK(HTTPS)
-        TRY_PROTO_MASK(IMAP)
-        TRY_PROTO_MASK(IMAPS)
-        TRY_PROTO_MASK(LDAP)
-        TRY_PROTO_MASK(LDAPS)
-        TRY_PROTO_MASK(POP3)
-        TRY_PROTO_MASK(POP3S)
-        TRY_PROTO_MASK(RTMP)
-        TRY_PROTO_MASK(RTMPE)
-        TRY_PROTO_MASK(RTMPS)
-        TRY_PROTO_MASK(RTMPT)
-        TRY_PROTO_MASK(RTMPTE)
-        TRY_PROTO_MASK(RTMPTS)
-        TRY_PROTO_MASK(RTSP)
-        TRY_PROTO_MASK(SCP)
-        TRY_PROTO_MASK(SFTP)
-        TRY_PROTO_MASK(SMB)
-        TRY_PROTO_MASK(SMBS)
-        TRY_PROTO_MASK(SMTP)
-        TRY_PROTO_MASK(SMTPS)
-        TRY_PROTO_MASK(TELNET)
-        TRY_PROTO_MASK(TFTP)
-        NORM_ERR("curl option 'REDIR_PROTOCOLS' given unknown token '%s'", token.c_str());
-      }
-      curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, mask);
-      continue;
-    } 
-    TRY_STR_OPT(DEFAULT_PROTOCOL)
-    TRY_STR_OPT(PROXY)
-    TRY_STR_OPT(PRE_PROXY)
-    TRY_LONG_OPT(PROXYPORT)
-    if (opt_name == "PROXYTYPE") {
-      auto type_str = opts[opt_name].asString();
-      unsigned long type{0};
-      TRY_PROXY_TYPE(HTTP)
-      else TRY_PROXY_TYPE(HTTPS)
-      else TRY_PROXY_TYPE(HTTP_1_0)
-      else TRY_PROXY_TYPE(SOCKS4)
-      else TRY_PROXY_TYPE(SOCKS4A)
-      else TRY_PROXY_TYPE(SOCKS5)
-      else TRY_PROXY_TYPE(SOCKS5_HOSTNAME)
-      curl_easy_setopt(curl, CURLOPT_PROXYTYPE, type);
-      continue;
+    // built against documentation from https://curl.se/libcurl/c/curl_easy_setopt.html
+    switch (cexpr_hash( opt_name.c_str(), opt_name.size() ))
+    {
+    CASE_LONG_OPT(VERBOSE)
+    CASE_LONG_OPT(HEADER)
+    CASE_STR_OPT(URL)
+    CASE_LONG_OPT(PATH_AS_IS)
+    BEGIN_CASE_MASK_OPT(PROTOCOLS)
+      CASE_PROTO_MASK(DICT)
+      CASE_PROTO_MASK(FILE)
+      CASE_PROTO_MASK(FTP)
+      CASE_PROTO_MASK(FTPS)
+      CASE_PROTO_MASK(GOPHER)
+      CASE_PROTO_MASK(HTTP)
+      CASE_PROTO_MASK(HTTPS)
+      CASE_PROTO_MASK(IMAP)
+      CASE_PROTO_MASK(IMAPS)
+      CASE_PROTO_MASK(LDAP)
+      CASE_PROTO_MASK(LDAPS)
+      CASE_PROTO_MASK(POP3)
+      CASE_PROTO_MASK(POP3S)
+      CASE_PROTO_MASK(RTMP)
+      CASE_PROTO_MASK(RTMPE)
+      CASE_PROTO_MASK(RTMPS)
+      CASE_PROTO_MASK(RTMPT)
+      CASE_PROTO_MASK(RTMPTE)
+      CASE_PROTO_MASK(RTMPTS)
+      CASE_PROTO_MASK(RTSP)
+      CASE_PROTO_MASK(SCP)
+      CASE_PROTO_MASK(SFTP)
+      CASE_PROTO_MASK(SMB)
+      CASE_PROTO_MASK(SMBS)
+      CASE_PROTO_MASK(SMTP)
+      CASE_PROTO_MASK(SMTPS)
+      CASE_PROTO_MASK(TELNET)
+      CASE_PROTO_MASK(TFTP)
+    END_CASE_MASK_OPT(PROTOCOLS)
+    BEGIN_CASE_MASK_OPT(REDIR_PROTOCOLS)
+      CASE_PROTO_MASK(DICT)
+      CASE_PROTO_MASK(FILE)
+      CASE_PROTO_MASK(FTP)
+      CASE_PROTO_MASK(FTPS)
+      CASE_PROTO_MASK(GOPHER)
+      CASE_PROTO_MASK(HTTP)
+      CASE_PROTO_MASK(HTTPS)
+      CASE_PROTO_MASK(IMAP)
+      CASE_PROTO_MASK(IMAPS)
+      CASE_PROTO_MASK(LDAP)
+      CASE_PROTO_MASK(LDAPS)
+      CASE_PROTO_MASK(POP3)
+      CASE_PROTO_MASK(POP3S)
+      CASE_PROTO_MASK(RTMP)
+      CASE_PROTO_MASK(RTMPE)
+      CASE_PROTO_MASK(RTMPS)
+      CASE_PROTO_MASK(RTMPT)
+      CASE_PROTO_MASK(RTMPTE)
+      CASE_PROTO_MASK(RTMPTS)
+      CASE_PROTO_MASK(RTSP)
+      CASE_PROTO_MASK(SCP)
+      CASE_PROTO_MASK(SFTP)
+      CASE_PROTO_MASK(SMB)
+      CASE_PROTO_MASK(SMBS)
+      CASE_PROTO_MASK(SMTP)
+      CASE_PROTO_MASK(SMTPS)
+      CASE_PROTO_MASK(TELNET)
+      CASE_PROTO_MASK(TFTP)
+    END_CASE_MASK_OPT(REDIR_PROTOCOLS)
+    CASE_STR_OPT(DEFAULT_PROTOCOL)
+    CASE_STR_OPT(PROXY)
+    CASE_STR_OPT(PRE_PROXY)
+    CASE_LONG_OPT(PROXYPORT)
+    BEGIN_CASE_ENUM_OPT(PROXYTYPE)
+      CASE_PROXY_ENUM(HTTP)
+      CASE_PROXY_ENUM(HTTPS)
+      CASE_PROXY_ENUM(HTTP_1_0)
+      CASE_PROXY_ENUM(SOCKS4)
+      CASE_PROXY_ENUM(SOCKS4A)
+      CASE_PROXY_ENUM(SOCKS5)
+      CASE_PROXY_ENUM(SOCKS5_HOSTNAME)
+    END_CASE_ENUM_OPT(PROXYTYPE)
+    CASE_STR_OPT(NOPROXY)
+    CASE_LONG_OPT(HTTPPROXYTUNNEL)
+    CASE_LIST_OPT(CONNECT_TO, connect_to_list)
+    BEGIN_CASE_MASK_OPT(SOCKS5_AUTH)
+      CASE_AUTH_MASK(BASIC)
+      CASE_AUTH_MASK(GSSAPI)
+      CASE_AUTH_MASK(NONE)
+    END_CASE_MASK_OPT(SOCKS5_AUTH)
+    CASE_STR_OPT(SOCKS5_GSSAPI_SERVICE)
+    CASE_LONG_OPT(SOCKS5_GSSAPI_NEC)
+    CASE_STR_OPT(PROXY_SERVICE_NAME)
+    CASE_LONG_OPT(HAPROXYPROTOCOL)
+    CASE_STR_OPT(SERVICE_NAME)
+    CASE_STR_OPT(INTERFACE)
+    CASE_LONG_OPT(LOCALPORT)
+    CASE_LONG_OPT(LOCALPORTRANGE)
+    CASE_LONG_OPT(DNS_CACHE_TIMEOUT)
+    CASE_STR_OPT(DOH_URL)
+    CASE_LONG_OPT(BUFFERSIZE)
+    CASE_LONG_OPT(PORT)
+    CASE_LONG_OPT(TCP_FASTOPEN)
+    CASE_LONG_OPT(TCP_NODELAY)
+    CASE_LONG_OPT(ADDRESS_SCOPE)
+    CASE_LONG_OPT(TCP_KEEPALIVE)
+    CASE_LONG_OPT(TCP_KEEPIDLE)
+    CASE_LONG_OPT(TCP_KEEPINTVL)
+    CASE_STR_OPT(UNIX_SOCKET_PATH)
+    CASE_STR_OPT(ABSTRACT_UNIX_SOCKET)
+
+
+    CASE_LONG_OPT(NETRC)
+    CASE_STR_OPT(NETRC_FILE)
+    CASE_STR_OPT(USERPWD)
+    CASE_STR_OPT(PROXYUSERPWD)
+    CASE_STR_OPT(USERNAME)
+    CASE_STR_OPT(PASSWORD)
+    CASE_STR_OPT(LOGIN_OPTIONS)
+    CASE_STR_OPT(PROXYUSERNAME)
+    CASE_STR_OPT(PROXYPASSWORD)
+    BEGIN_CASE_MASK_OPT(HTTPAUTH)
+      CASE_AUTH_MASK(BASIC)
+      CASE_AUTH_MASK(DIGEST)
+      CASE_AUTH_MASK(DIGEST_IE)
+      CASE_AUTH_MASK(BEARER)
+      CASE_AUTH_MASK(NEGOTIATE)
+      CASE_AUTH_MASK(NTLM)
+      CASE_AUTH_MASK(NTLM_WB)
+      CASE_AUTH_MASK(ANY)
+      CASE_AUTH_MASK(ANYSAFE)
+      CASE_AUTH_MASK(ONLY)
+      //CASE_AUTH_MASK(AWS_SIGV4) //not available in my version of curl?
+    END_CASE_MASK_OPT(HTTPAUTH)
+    CASE_STR_OPT(TLSAUTH_USERNAME)
+    CASE_STR_OPT(PROXY_TLSAUTH_USERNAME)
+    CASE_STR_OPT(TLSAUTH_PASSWORD)
+    CASE_STR_OPT(PROXY_TLSAUTH_PASSWORD)
+    CASE_STR_OPT(TLSAUTH_TYPE)
+    CASE_STR_OPT(PROXY_TLSAUTH_TYPE)
+    CASE_LONG_OPT(PROXYAUTH)
+    CASE_STR_OPT(SASL_AUTHZID)
+    CASE_LONG_OPT(SASL_IR)
+    CASE_STR_OPT(XOAUTH2_BEARER)
+    CASE_LONG_OPT(DISALLOW_USERNAME_IN_URL)
+    
+    
+    CASE_LONG_OPT(AUTOREFERER)
+    CASE_STR_OPT(ACCEPT_ENCODING)
+    CASE_LONG_OPT(TRANSFER_ENCODING)
+    CASE_LONG_OPT(FOLLOWLOCATION)
+    CASE_LONG_OPT(UNRESTRICTED_AUTH)
+    CASE_LONG_OPT(MAXREDIRS)
+    CASE_LONG_OPT(POSTREDIR)
+    CASE_LONG_OPT(PUT)
+    CASE_LONG_OPT(POST)
+    CASE_STR_CACHE_OPT(POSTFIELDS, postfields)
+    CASE_LONG_OPT(POSTFIELDSIZE)
+    CASE_LONG_OPT(POSTFIELDSIZE_LARGE)
+    CASE_STR_OPT(COPYPOSTFIELDS)
+
+    CASE_STR_OPT(REFERER)
+    CASE_STR_OPT(USERAGENT)
+    CASE_LIST_OPT(HTTPHEADER, user_headers)
+    CASE_LONG_OPT(HEADEROPT)
+    CASE_LIST_OPT(PROXYHEADER, proxyheaders)
+
+    default:
+      NORM_ERR("unhandled curl option '%s'", opt_name.c_str()); \
+      break;
     }
-    TRY_STR_OPT(NOPROXY)
-    TRY_LONG_OPT(HTTPPROXYTUNNEL)
-
-
-    if (opt_name == "HTTPAUTH") {
-      auto tokens = vectorize(opts[opt_name], ",");
-      unsigned long mask{0};
-      for (const auto& token : tokens) {
-        TRY_AUTH_MASK(BASIC)
-        TRY_AUTH_MASK(DIGEST)
-        TRY_AUTH_MASK(DIGEST_IE)
-        TRY_AUTH_MASK(BEARER)
-        TRY_AUTH_MASK(NEGOTIATE)
-        TRY_AUTH_MASK(NTLM)
-        TRY_AUTH_MASK(NTLM_WB)
-        TRY_AUTH_MASK(ANY)
-        TRY_AUTH_MASK(ANYSAFE)
-        TRY_AUTH_MASK(ONLY)
-        NORM_ERR("curl option 'HTTPAUTH' given unknown token '%s'", token.c_str());
-      }
-      curl_easy_setopt(curl, CURLOPT_HTTPAUTH, mask);
-      continue;
-    } 
-    TRY_STR_OPT(XOAUTH2_BEARER)
-    
-    
-    if (opt_name == "HTTPHEADER") {
-      user_headers = vectorize(opts[opt_name], ",");
-      //headers get mucked with in do_work(), so we just cache the raw list here
-      continue;
-    } 
 
     //TODO: a lot more of libcurl
   }
