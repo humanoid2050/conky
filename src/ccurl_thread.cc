@@ -202,7 +202,7 @@ void curl_parse_arg(struct text_object *obj, const char *arg) {
     char *interval_str = &space[1];
     *space = '\0';
     sscanf(interval_str, "%f", &interval);
-    cd->interval = interval > 0 ? interval * 60 : active_update_interval();
+    cd->interval = interval > 0 ? interval : active_update_interval();
   }
 
   obj->data.opaque = cd;
