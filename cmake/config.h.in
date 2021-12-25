@@ -80,6 +80,8 @@
 
 #cmakedefine BUILD_CURL 1
 
+#cmakedefine BUILD_CURL_ADVANCED 1
+
 #cmakedefine BUILD_WEATHER_METAR 1
 
 #cmakedefine BUILD_IMLIB2 1

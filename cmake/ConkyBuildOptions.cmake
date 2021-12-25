@@ -231,6 +231,11 @@ option(BUILD_XMMS2 "Enable if you want XMMS2 (music player) support" false)
 
 option(BUILD_CURL "Enable if you want Curl support" false)
 
+option(BUILD_CURL_ADVANCED "Enable if you want enahnced configuration options for Curl" false)
+if(BUILD_CURL_ADVANCED)
+  set(BUILD_CURL true)
+endif(BUILD_CURL_ADVANCED)
+
 option(BUILD_RSS "Enable if you want RSS support" false)
 
 option(BUILD_WEATHER_METAR "Enable METAR weather support" true)

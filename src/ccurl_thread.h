@@ -30,6 +30,11 @@
 #include "logging.h"
 #include "update-cb.hh"
 
+#ifdef BUILD_CURL_ADVANCED
+#include <vector>
+#include "json/json.h"
+#endif /* BUILD_CURL_ADVANCED */
+
 namespace priv {
 // factored out stuff that does not depend on the template parameters
 class curl_internal {
@@ -53,7 +58,16 @@ class curl_internal {
   virtual ~curl_internal() {
     if (curl) curl_easy_cleanup(curl);
   }
+
+#ifdef BUILD_CURL_ADVANCED
+ protected:
+  std::vector<std::string> user_headers;
+  void apply_opts(CURL* curl, const Json::Value& opts);
+#endif /* BUILD_CURL_ADVANCED */
 };
+
+std::vector<std::string> vectorize(const std::string& input, const char* delim = nullptr);
+
 }  // namespace priv
 
 /*
