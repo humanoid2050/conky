@@ -121,6 +121,49 @@
     <varlistentry>
         <term>
             <command>
+                <option>curl_connections</option>
+            </command>
+        </term>
+        <listitem>A string which can be parsed as JSON, representing parameters
+        for variaous connections which may be created using the $curl variable.
+        The top level JSON value must be an object. The keys in this object
+        may be referenced as ${curl key interval} to reduce clutter and permit
+        reuse of connection definitions in the conky.text block. Each connection
+        key's value must be an object. The permissible keys in this inner object
+        are derived from the options described in 
+        https://curl.se/libcurl/c/curl_easy_setopt.html. A particular curl option
+        can be invoked using the unique part of the enum for that option. For
+        example, CURLOPT_URL becomes "URL" and CURLOPT_VERBOSE becomes "VERBOSE". The
+        value associated with each option key depends on the option in question.
+        If a string value is requred, a string should be supplied. If the curl 
+        library expects a numeric value, a number should be supplied. Supplied 
+        values will be coerced to the correct type, which means JSON true/false
+        can be used for curl options that expect a numeric value of 1 or 0. Some
+        curl options expect an enumerated value as the argument. Curl enums can
+        be expressed as strings matching the unqiue part of the enum set's names.
+        For example when specifying a "PROXYTYPE", the type can be specified as
+        a string like "HTTP" or "SOCKS4". If multiple enumerated values are 
+        expected to be passed to the option as a mask, the string to enum mapping
+        remains the same. However, multiple values can be selected by using 
+        a string of comma-separated values, or a JSON array of string values.
+        For example, "PROTOCOLS" could be suppled the value "HTTP,HTTPS" or
+        ["HTTP", "HTTPS"]. For opts which require a list of strings, the strings
+        can be provided as a single string with comma-separated values. The
+        better practice in this case though is to provide each string separately
+        in a JSON array, as it will avoid unexpected splits. A full example:
+        curl_connections = [[{"my_connection": {"URL": "http://myserver:5000/api/job",
+        "HTTPAUTH": "BEARER", "XOAUTH2_BEARER": "1234567890ABCDEF1234567890ABCDEF",
+        "VERBOSE": true, "HTTPHEADER": ["X_My-Header: some custom header"]}}]]
+        Note the use of double square brackets, which tells the lua interpreter
+        to treat the entire thing as a single string. This allows you to use
+        pretty-printed json in your config. Please note that not every curl option 
+        has been implemented. Some don't make sense in the context of conky, and 
+        some just need more time to be added to the codebase.
+        <para /></listitem>
+    </varlistentry>
+    <varlistentry>
+        <term>
+            <command>
                 <option>default_bar_height</option>
             </command>
         </term>
