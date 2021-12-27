@@ -38,7 +38,8 @@
 
 #ifdef BUILD_CURL_ADVANCED
 //declare curl_opts config entry
-conky::simple_config_setting<std::string> curl_opts("curl_opts", "", true);
+//this can be used to specify parameters for connections known in advance
+conky::simple_config_setting<std::string> curl_connections("curl_connections", "", true);
 #endif /* CURL_ADVANCED */
 
 
@@ -84,15 +85,15 @@ size_t curl_internal::write_cb(void *ptr, size_t size, size_t nmemb,
   return realsize;
 }
 
-curl_internal::curl_internal(const std::string &url) : curl(curl_easy_init()) {
+curl_internal::curl_internal(const std::string &connection) : curl(curl_easy_init()) {
   if (!curl) throw std::runtime_error("curl_easy_init() failed");
 
+  //standard issue options
   curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1);
   curl_easy_setopt(curl, CURLOPT_HEADERDATA, this);
   curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, parse_header_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, this);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_USERAGENT, "conky-curl/1.1");
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
   curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1000);
@@ -103,42 +104,47 @@ curl_internal::curl_internal(const std::string &url) : curl(curl_easy_init()) {
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
 
 #ifdef BUILD_CURL_ADVANCED
-
-  if (0 != strcmp(curl_opts.get(*state).c_str(), "")) {
-    // we have curl_opts to consider
-    // convert curl_opts string into a json struct
-    Json::Value curl_conf;
-    Json::Reader reader;
-    bool parse_success = reader.parse(curl_opts.get(*state), curl_conf);
+  //destination for any identified configuration
+  Json::Value opts{Json::nullValue};
+  Json::Value curl_conf;
+  Json::Reader reader;
+  //is this a lookup key in the curl_connections JSON?
+  if (!curl_connections.get(*state).empty()) {
+    bool parse_success = reader.parse(curl_connections.get(*state), curl_conf);
     if (!parse_success) {
-      NORM_ERR(
-        "conky.config entry 'curl_opts' failed to parse as valid json."
-        "Continuing without advanced options.\n");
-      return;
-    }
-    if (!curl_conf.isObject()) {
-      NORM_ERR(
-        "conky.config entry 'curl_opts' did not parse as a json object."
-        "%s"
-        "Continuing without advanced options.\n",curl_opts.get(*state).c_str());
-      return;
-    }
-    // look for key matching url
-    if (curl_conf.isMember(url)) {
-      const Json::Value& opts = curl_conf[url];
-      //expect dictionary
-      if (!opts.isObject()) {
-        NORM_ERR(
-          "'curl_opts' entry for '%s' did not parse as a json object."
-          "Continuing without advanced options.\n", url.c_str());
+      //parsing failure
+      NORM_ERR("conky.config entry 'curl_connections' failed to parse as valid json.");
+    } else if (!curl_conf.isObject()) {
+      //type failure
+      NORM_ERR("conky.config entry 'curl_connections' did not parse as a json object.");
+    } else if (curl_conf.isMember(connection)) {
+      // found connection in curl conf
+      if (!curl_conf[connection].isObject()) {
+        //fail if wton type
+        NORM_ERR("'curl_connections' entry for '%s' did not parse as a json object.", connection.c_str());
         return;
       }
-      apply_opts(curl, opts);
-    } else {
-      NORM_ERR("no curl_opts for url: %s", url.c_str());
+      opts = curl_conf[connection];
     }
+  } 
+
+  if (opts.isNull()) {
+    //maybe the connection is already raw json?
+    bool parse_success = reader.parse(connection, opts);
+    if (!parse_success) {
+      NORM_ERR("$curl connection did not parse as json: %s",connection.c_str());
+    } else if (!opts.isObject()) {
+      NORM_ERR("curl connection did not parse as a json object: %s",connection.c_str());
+      return;
+    } 
   }
+
+  //if opts is not null, then it was successfully set as an object with curl options
+  if (!opts.isNull()) 
+    apply_opts(curl, opts);
+  else //fall through to the original behavior of the connection defining a curl url
 #endif /* CURL_ADVANCED */
+  curl_easy_setopt(curl, CURLOPT_URL, connection.c_str());
 
 }
 
@@ -146,7 +152,11 @@ curl_internal::curl_internal(const std::string &url) : curl(curl_easy_init()) {
 void curl_internal::do_work() {
   CURLcode res;
   //copy construct a temporary header list, so as not to destroy the original
+#ifdef BUILD_CURL_ADVANCED
   wrapped_slist headers(user_headers);
+#else
+  wrapped_slist headers;
+#endif
   data.clear();
 
   //updating the headers with etag and last_modified values is clever,
@@ -209,10 +219,9 @@ void curl_internal::do_work() {
       curl_easy_setopt(curl, CURLOPT_##name, opts[opt_name].asInt64()); \
       break;
 
-//bitmask opt defines
 #define BEGIN_CASE_MASK_OPT(name) \
     case cexpr_hash(#name): \
-      { /* extra scoping for initialized variables */ \
+      { /* extra scope for variable initialization */ \
         long mask {0}; \
         for (const auto& token : vectorize(opts[opt_name], ",")) { \
           switch (cexpr_hash( token.c_str(), token.size() )) {
@@ -304,6 +313,7 @@ std::vector<std::string> vectorize(const Json::Value& input, const char* delim)
 }
 
 //helpers to do compile-time hashing of tokens
+// yoinked from https://en.cppreference.com/w/cpp/named_req/LiteralType
 class conststr
 {
     const char* p;
@@ -549,9 +559,15 @@ void ccurl_process_info(char *p, int p_max_size, const std::string &uri,
 void curl_parse_arg(struct text_object *obj, const char *arg) {
   struct curl_data *cd;
   float interval = 0;
-  char *space;
+  const char *marker{nullptr};
 
-  if (strlen(arg) < 1) {
+  //arg is the raw input string. It is expected to have a connection
+  //specifier followed by an optional interval value. The connection
+  //specifier may be a url, a lookup in the conky.config[curl_connections]
+  //blob, or a string parsable as JSON with all the necessary parameters.
+
+  size_t arg_len = strlen(arg);
+  if (arg_len < 1) {
     NORM_ERR("wrong number of arguments for $curl");
     return;
   }
@@ -559,19 +575,27 @@ void curl_parse_arg(struct text_object *obj, const char *arg) {
   cd = static_cast<struct curl_data *>(malloc(sizeof(struct curl_data)));
   memset(cd, 0, sizeof(struct curl_data));
 
-  // Default to a 15 minute interval
-  cd->interval = 15 * 60;
+  //if advanced curl is enabled, the delimiters may be {..}, else old style ' '
+  marker = 
+#ifdef BUILD_CURL_ADVANCED
+    arg[0] == '{' ? strrchr(arg,'}')+1 : 
+#endif
+    strchr(arg, ' ');
+  
+  //if marker found, consume up to marker
+  //note that there is no validation of JSON at this stage (i.e. unmatched '{')
+  cd->uri = marker ? strndup(arg, marker-arg) : strdup(arg);
 
-  cd->uri = strdup(arg);
-  space = strchr(cd->uri, ' ');
-  if (space) {
-    // If an explicit interval was given, use that
-    char *interval_str = &space[1];
-    *space = '\0';
-    sscanf(interval_str, "%f", &interval);
-    cd->interval = interval > 0 ? interval : active_update_interval();
+  //failsafe set interval to 15 minutes
+  cd->interval = 15*60;
+  //check if there is a floating point value after the marker
+  if (marker) {
+    int r = sscanf(marker+1, "%f", &interval);
+    if (r == 1) {
+      cd->interval = interval > 0 ? interval : active_update_interval();
+    }
   }
-
+  
   obj->data.opaque = cd;
 }
 

@@ -30,8 +30,8 @@
 #include "logging.h"
 #include "update-cb.hh"
 
-#ifdef BUILD_CURL_ADVANCED
 #include <vector>
+#ifdef BUILD_CURL_ADVANCED
 #include "json/json.h"
 #endif /* BUILD_CURL_ADVANCED */
 
@@ -40,7 +40,7 @@ struct wrapped_slist {
   struct curl_slist *slist;
 
   wrapped_slist() : slist(nullptr) {}
-  wrapped_slist(const wrapped_slist& other)
+  wrapped_slist(const wrapped_slist& other) : slist(nullptr)
   {
     struct curl_slist *tmp = other.slist;
     while (tmp != nullptr) {
